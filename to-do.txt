@@ -1,0 +1,459 @@
+# OpenCode Build Specification (to-do.txt)
+
+# AUTONOMOUS BUILD SPECIFICATION: RAGWire Studio (v0.10 -> v1.0.0)
+
+
+
+## EXECUTION DIRECTIVE (AUTONOMOUS MODE)
+
+You are operating in **autonomous end-to-end build mode**. Read this entire specification carefully and execute every phase sequentially without stopping to ask for confirmation. Do NOT stop until:
+
+1. All backend, frontend, Docker Compose, management scripts, and installer-builder scripts are implemented.
+
+2. The full stack is running via `docker compose`.
+
+3. Automated backend API tests AND end-to-end **Playwright** browser UI tests have executed and passed against the live running application.
+
+4. The repository version has been incremented through every milestone up to **`1.0.0`**, and the version-stamped installer artifact (`dist/ragwire-studio-installer-v1.0.0.sh`) has been generated and verified.
+
+
+
+---
+
+
+
+## STEP 0: VERSION CONTROL, MILESTONE DISCIPLINE & `progress.md` HANDOFF LOG
+
+Initialize a local Git repository (`git init`) and maintain a `VERSION` file at the project root alongside semantic Git commits/tags at every milestone:
+
+- **`0.10`**: Initial project scaffolding, Git init, `VERSION` file, `progress.md` initialization, `.env`, `docker-compose.yml`, and RAGWire documentation/source inspection.
+
+- **`0.11`**: Database schema (SQLite), RBAC models, JWT auth, and initial Admin seeding.
+
+- **`0.12`**: RAGWire integration, custom `llama.cpp` adapters (Chat/Vision, `bge-m3` Embeddings, `qwen3-reranker-8b` Reranker), and async background ingestion worker with concurrency throttling & deduplication.
+
+- **`0.13`**: Knowledge Libraries API (usage counters, safe deletion lock, LLM auto-summary generation), Projects API (dedicated library + shared library attachments + clean cascade deletion), and authenticated file delivery endpoint.
+
+- **`0.20`**: Major UI milestone — Complete React + TypeScript + Vite + Tailwind frontend (Hybrid Gemini Chat + Gemini Notebook 3-pane workspace, interactive Diagrams & Infographics studio/renderer, chat export/regeneration, Knowledge Library manager, Admin Console).
+
+- **`0.21`**: Management scripts (`start.sh`, `stop.sh`, `status.sh`, `logs.sh`, `backup.sh`) and `build-installer.sh` producing version-stamped standalone installer.
+
+- **`0.22`**: Playwright E2E test suite execution, bug fixes, and full verification.
+
+- **`1.0.0`**: Final release bump (`VERSION` = `1.0.0`), rebuild version-stamped `v1.0.0` installer, clean Git commit & tag `v1.0.0`.
+
+
+
+Expose `GET /api/version` returning `{"version": "<contents of VERSION>"}` and display the version badge in the UI footer/navbar.
+
+
+
+### Continuous Developer Handoff Logging (`progress.md`)
+
+Maintain a living **`progress.md`** file in the project root and update it **before and after every milestone/step** so that another human developer or AI agent can seamlessly take over at any moment if interrupted. `progress.md` MUST contain and keep up to date:
+
+1. **Current Status Banner:** Active `VERSION`, current step/milestone in progress, and overall completion checklist (`[x]` / `[ ]`).
+
+2. **Architecture & Directory Map:** Quick-reference tree of `backend/`, `frontend/`, `scripts/`, volumes, ports, and key files created so far.
+
+3. **RAGWire API Findings & Adapter Notes:** Exact RAGWire classes/methods discovered during Step 1 and how they are wrapped.
+
+4. **Chronological Milestone Log:** Timestamped entries recording what was completed at each version bump (`0.10` -> `1.0.0`), architectural decisions made, test results, and any known edge cases or workarounds.
+
+5. **Next Immediate Action:** Explicit note stating the exact next task to execute if work resumes from this checkpoint.
+
+
+
+---
+
+
+
+## STEP 1: MANDATORY PRE-IMPLEMENTATION INSPECTION OF RAGWIRE
+
+Before writing application code, inspect **RAGWire** (`https://laxmimerit.github.io/RAGWire/` and the installed `ragwire` Python package source) to verify its exact class names, method signatures, chunkers, document loaders, and Qdrant connectors. Document your findings in `progress.md`. Do NOT guess or hallucinate RAGWire APIs. Use RAGWire for core document parsing, chunking, and pipeline orchestration, and build clean, thin custom adapter classes for our `llama.cpp` endpoints (`:8080/v1`, `:8082/v1`, `:8083/v1/rerank`) wherever RAGWire lacks native support.
+
+
+
+---
+
+
+
+## STEP 2: INFRASTRUCTURE & DOCKER COMPOSE
+
+Use **`docker compose`** (Docker Compose v2 plugin syntax — NEVER `docker-compose`).
+
+Create `docker-compose.yml`, `.env.example`, and `.env` with persistent named volumes:
+
+1. **`qdrant`**: Official `qdrant/qdrant` image with persistent `/qdrant/storage` volume.
+
+2. **`backend`**: Python 3.11+ **FastAPI** service (`uvicorn`) with SQLite stored on persistent `/data/db/app.db` and raw uploaded files/photos stored on persistent `/data/uploads`.
+
+3. **`frontend`**: **React + TypeScript + Vite + Tailwind CSS** SPA built and served via Nginx on port `3000` (configurable via `APP_PORT=3000`), reverse-proxying `/api` to `backend`. Do NOT expose `/data/uploads` publicly without authentication—all uploaded files and image previews must be served through an authenticated backend endpoint.
+
+
+
+Default `.env` values:
+
+```env
+
+APP_PORT=3000
+
+INITIAL_ADMIN_EMAIL=admin@rag.local
+
+INITIAL_ADMIN_PASSWORD=admin
+
+JWT_SECRET_KEY=change-this-secret-in-production-ragwire-2026
+
+DEFAULT_CHAT_BASE_URL=http://100.69.140.69:8080/v1
+
+DEFAULT_CHAT_MODEL=chat
+
+DEFAULT_EMBED_BASE_URL=http://100.90.101.96:8082/v1
+
+DEFAULT_EMBED_MODEL=bge-m3
+
+DEFAULT_RERANK_URL=http://100.90.101.96:8083/v1/rerank
+
+DEFAULT_RERANK_MODEL=reranker
+
+MAX_CONCURRENT_VLM_CALLS=1
+
+```
+
+
+
+---
+
+
+
+## STEP 3: `llama.cpp` ENDPOINTS, CONCURRENCY PROTECTION & RUNTIME SETTINGS
+
+Store all model configurations in SQLite (seeded from `.env` on first startup) so **Admins** can update them live via the UI without restarting containers:
+
+1. **Chat & Vision LLM (`http://100.69.140.69:8080/v1`, model `chat`):**
+
+   - Qwen3.8-next with multimodal vision (`--mmproj`), `--parallel 2`, and `--reasoning-format deepseek`.
+
+   - **Concurrency Protection (`MAX_CONCURRENT_VLM_CALLS=1`):** Because the remote `llama-server` runs with `--parallel 2` (two unified KV slots), guard background Vision photo-ingestion calls with an `asyncio.Semaphore(MAX_CONCURRENT_VLM_CALLS)` (default `1`). This guarantees bulk photo uploads queue cleanly and never starve interactive user chat requests of the second KV slot.
+
+   - Stream responses via OpenAI-compatible SSE (`stream=True`).
+
+   - Parse DeepSeek reasoning tags (`<think>...</think>` and/or SSE `reasoning_content` deltas) separately from the main answer so the UI renders them in a collapsible **"Thinking Process"** accordion.
+
+2. **Embedding Model (`http://100.90.101.96:8082/v1`, model `bge-m3`):**
+
+   - `bge-m3` (`--embedding --pooling mean --ctx-size 8192`). Configure Qdrant collection with Cosine distance and auto-detected embedding dimension (1024 for `bge-m3`).
+
+3. **Reranker Model (`http://100.90.101.96:8083/v1/rerank`, model `reranker`):**
+
+   - `qwen3-reranker-8b` (`--reranking --ctx-size 2048`).
+
+   - **CRITICAL:** Keep RAGWire chunks around **512 tokens** with **64-token overlap** so `query + chunk` pairs never exceed the reranker's `2048`-token context limit.
+
+   - Support Cohere/Jina-compatible `/v1/rerank` (with automatic fallback to `/rerank` if 404).
+
+4. **Admin Model Settings UI:**
+
+   - Editable fields for Chat URL/Model/API Key, Embedding URL/Model/API Key, Reranker URL/Model/API Key, `retrieval_top_k` (default `20`), `rerank_top_n` (default `5`), `rerank_score_threshold`, and `max_concurrent_vlm_calls` (default `1`), plus a **"Test All Connections"** button checking Chat, Embeddings, Reranker, and Qdrant health.
+
+
+
+---
+
+
+
+## STEP 4: USERS, RBAC & AUTHENTICATED FILE ACCESS
+
+Implement JWT authentication (`POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/change-password`) with 3 roles:
+
+1. **`normal_user`**:
+
+   - Create/manage/delete **only their own** Projects and chat histories.
+
+   - Upload/delete/retry files in their own Project's dedicated library.
+
+   - Attach/detach shared Knowledge Libraries to their own Projects.
+
+2. **`library_operator`** (Knowledge Library Operator):
+
+   - Everything a `normal_user` can do (and like Normal Users, sees **only their own** Projects and chat histories).
+
+   - Create shared Knowledge Libraries, upload/delete/retry documents inside shared Knowledge Libraries, and delete shared Knowledge Libraries **ONLY when `usage_count == 0`** (enforce strictly on backend with HTTP `409 Conflict` and disabled button + tooltip on frontend).
+
+3. **`admin`**:
+
+   - Everything `library_operator` and `normal_user` can do.
+
+   - Create/delete users and assign/update roles (`normal_user`, `library_operator`, `admin`). Prevent deleting the last remaining Admin.
+
+   - View **ALL users' Projects** (and their chat histories) via an **"All Projects (Admin View)"** toggle, and delete **any** Project.
+
+   - Edit global LLM / Embedding / Reranker settings.
+
+4. **Authenticated File & Photo Delivery (`GET /api/files/{document_id}/content`):**
+
+   - Never serve `/data/uploads` publicly without authorization. Serve original files and source photo thumbnails/lightboxes through `GET /api/files/{document_id}/content` validating either the `Authorization: Bearer <jwt>` header or a short-lived signed file token query parameter (`?token=...`) so standard `<img>` tags render cleanly while verifying the user has access to the document's library (shared library -> any authenticated user; project-dedicated library -> project owner or `admin`).
+
+
+
+Seed `INITIAL_ADMIN_EMAIL` (`admin@rag.local`) and `INITIAL_ADMIN_PASSWORD` (`admin`) automatically on first startup.
+
+
+
+---
+
+
+
+## STEP 5: KNOWLEDGE LIBRARIES & PROJECTS ARCHITECTURE
+
+Use a single unified Qdrant collection with payload filtering (`library_id`):
+
+1. **Shared Knowledge Libraries (`is_project_dedicated = False`):**
+
+   - Created by `library_operator` or `admin`.
+
+   - Fields: `id`, `name`, `auto_summary` (concise 1–2 sentence auto-generated description), `created_by`, `usage_count` (count of Projects currently attaching this library), `created_at`, `updated_at`.
+
+   - **Automatic Concise Summary Generation:** Whenever documents finish indexing in (or are deleted from) a shared Knowledge Library, asynchronously call the configured Chat LLM (`:8080/v1`) with representative chunks from the library to generate/update a **super concise summary (20–35 words)** describing the library's contents so Normal Users can pick the right libraries for their Projects.
+
+   - Visible to all authenticated users in the Project library selector.
+
+2. **Projects:**
+
+   - Fields: `id`, `name`, `description`, `owner_id`, `dedicated_library_id`, `created_at`.
+
+   - Creating a Project automatically creates one dedicated internal Knowledge Library (`is_project_dedicated = True`) bound 1-to-1 to that Project for project-specific uploads.
+
+   - Attaching a shared Knowledge Library increments its `usage_count`; detaching decrements its `usage_count`.
+
+   - **Clean Cascade Project Deletion (Zero Rubbish Left Behind):** Deleting a Project must atomically:
+
+     1. Delete all Qdrant vectors matching `dedicated_library_id`.
+
+     2. Delete the directory `/data/uploads/<dedicated_library_id>/` from disk.
+
+     3. Decrement `usage_count` for every shared Knowledge Library attached to that Project.
+
+     4. Delete all chat sessions, chat messages, document records, and the `dedicated_library_id` row from SQLite.
+
+
+
+---
+
+
+
+## STEP 6: MULTIMODAL INGESTION, DEDUPLICATION, RETRY & ASYNC WORKER
+
+Support uploading: **PDF (`.pdf`), Word (`.docx`), Excel/Spreadsheets (`.xlsx`, `.xls`, `.csv`), Text/Markdown (`.txt`, `.md`), and Photos (`.jpg`, `.jpeg`, `.png`, `.webp`)**.
+
+1. **SHA-256 Duplicate File Detection:**
+
+   - Compute each uploaded file's `sha256` hash on arrival and store `file_hash` on the `Document` record.
+
+   - If an identical file hash already exists in the **same** library (with status `indexed`, `processing`, or `queued`), skip duplicate re-ingestion and return a clear notification (`"Duplicate file skipped: already exists in this library as <filename>"`) so users don't accidentally pollute Qdrant with duplicate chunks.
+
+2. **Async Background Worker & Failed-Job Retry:**
+
+   - Upload endpoint saves unique files to `/data/uploads/<library_id>/`, inserts `Document` records with `status = "queued"`, and dispatches an async background worker task immediately.
+
+   - Track states: `queued` -> `processing` (with step label like `"Waiting for VLM slot..."`, `"Vision analysis..."`, `"Chunking & embedding..."`, `"Updating library summary..."`) -> `indexed` or `failed` (`error_message`).
+
+   - Implement `POST /api/documents/{document_id}/retry` (and a **"Retry"** action button in the UI on any `failed` document) that clears any partial Qdrant vectors for `document_id`, resets status to `queued`, and re-runs ingestion without requiring the user to re-upload the file.
+
+   - Show live ingestion progress badges and polling/SSE updates in both the **Project Sources Drawer** and the **Knowledge Libraries Manager**.
+
+3. **Multimodal Photo Pipeline:**
+
+   - For `.jpg`, `.jpeg`, `.png`, `.webp` files: acquire the `MAX_CONCURRENT_VLM_CALLS` semaphore, base64-encode the image, and send it to the Vision-enabled Chat LLM (`:8080/v1`, model `chat`) to extract a rich, factual visual & OCR description. Embed that description with `bge-m3` and store `is_image=True`, `document_id`, and `image_url="/api/files/<document_id>/content"` in Qdrant payload metadata.
+
+
+
+---
+
+
+
+## STEP 7: VISUAL EXPLANATIONS — DIAGRAMS & INFOGRAPHICS ENGINE
+
+Since the local stack uses `Qwen3.8-next` (and does not require a separate diffusion image generator), empower the RAG assistant to natively generate **interactive diagrams** and **high-craft visual infographics** grounded in the Project's retrieved documents—both automatically when explaining complex flows/comparisons AND on-demand via quick-action buttons:
+
+
+
+1. **Interactive Diagrams (`Mermaid.js` + Zoom/Pan/Export):**
+
+   - Instruct the Chat LLM system prompt to output clean, valid ` ```mermaid ` code blocks whenever a user asks for a diagram (flowcharts, sequence diagrams, architecture diagrams, entity-relationship diagrams, timelines, mindmaps, state diagrams) or when explaining multi-step processes from the knowledge base.
+
+   - Render ` ```mermaid ` blocks automatically in the frontend using **Mermaid.js** inside an interactive card featuring:
+
+     - **Zoom In / Zoom Out / Reset** controls and a **Full-Screen Modal** viewer.
+
+     - **Toggle Raw Mermaid Code** button (with Copy button) and graceful fallback error boundary if syntax needs repair (including a **"Fix Diagram Syntax"** one-click retry button).
+
+     - **Export as SVG / PNG** download buttons.
+
+
+
+2. **Structured Visual Infographics (` ```infographic ` JSON -> Rich Visual Bento/Poster Renderer):**
+
+   - Define a structured ` ```infographic ` fenced block schema that `Qwen3.8-next` outputs when asked to create an infographic, executive summary poster, KPI breakdown, comparison matrix, or step-by-step visual guide from the retrieved documents:
+
+     ```json
+
+     {
+
+       "title": "Main Infographic Headline",
+
+       "subtitle": "Concise context or takeaway",
+
+       "theme": "blue | emerald | violet | amber",
+
+       "kpis": [{"label": "Metric Name", "value": "94%", "delta": "+12% vs baseline"}],
+
+       "sections": [
+
+         {
+
+           "heading": "Section Title",
+
+           "icon": "layers | shield | cpu | trending-up | check-circle | alert-triangle",
+
+           "layout": "steps | comparison | bullets | timeline",
+
+           "items": [{"title": "Point Title", "detail": "Concise grounded explanation", "badge": "Optional tag"}]
+
+         }
+
+       ],
+
+       "footer_note": "Key conclusion or source attribution"
+
+     }
+
+     ```
+
+   - Build a dedicated **Infographic Renderer Component** in React + Tailwind CSS that renders this JSON into a polished, publication-grade visual infographic poster (gradient header banner, KPI stat cards, iconographic bento grid / timeline / comparison columns, and source footer) complete with:
+
+     - **Export as High-Res PNG** (using `html-to-image` / `html2canvas`) and **Print / Save PDF** buttons.
+
+     - **Full-Screen Lightbox** preview.
+
+
+
+3. **Notebook Studio Quick-Actions (One-Click Visual Generation):**
+
+   - In the Right Studio/Sources Drawer and/or above the prompt composer, include one-click visual generator pills:
+
+     - **"Explain with Diagram"** (prompts the RAG pipeline to synthesize retrieved project sources into an explanatory walkthrough + Mermaid diagram).
+
+     - **"Create Infographic"** (prompts the RAG pipeline to synthesize retrieved project sources into a structured visual infographic).
+
+
+
+---
+
+
+
+## STEP 8: UI DESIGN (HYBRID GEMINI CHAT + GEMINI NOTEBOOK STUDIO)
+
+Build a clean, modern **React + TypeScript + Vite + Tailwind CSS** interface inspired by **Google Gemini** paired with **Gemini Notebook's 3-pane studio layout**, featuring Light/Dark mode toggle:
+
+1. **Left Collapsible Navigation Rail:**
+
+   - App title + version pill, "+ New Project" button, Project list (with **"All Projects (Admin)"** toggle for Admins, showing owner badge), and Chat Sessions list within the active Project.
+
+   - Bottom navigation links to **Knowledge Libraries** and **Admin Console** (role-gated), plus current user badge, Change Password modal, and Logout.
+
+2. **Center Gemini-Style Chat Canvas:**
+
+   - Top chat session action bar with **"Export Chat (Markdown)"** and **"Print / Save PDF"** buttons.
+
+   - Clean conversational layout with welcome prompt suggestions when empty, pill-shaped prompt composer at the bottom, streaming Markdown + code blocks, collapsible **"Thinking Process"** accordion for `<think>` content, embedded **Interactive Diagram Cards**, embedded **Visual Infographic Posters**, **"Regenerate Response"** button on assistant turns (especially useful after toggling attached Knowledge Libraries), and **interactive source citation cards** (showing Document name, Library name, Page/Sheet, Reranker score, snippet excerpt, and clickable **authenticated inline photo thumbnail + lightbox** when `is_image=True`).
+
+3. **Right Collapsible Context & Sources Drawer (Notebook-Style):**
+
+   - **Section A — Studio Visual Tools:** Quick buttons for **"Generate Diagram"** and **"Generate Infographic"** from active sources.
+
+   - **Section B — Project-Specific Documents:** Drag-and-drop uploader (with duplicate-file toast feedback) + live status list of files in this Project's dedicated library (with **"Retry"** button on failed documents).
+
+   - **Section C — Attached Knowledge Libraries:** Searchable list of all shared Knowledge Libraries displaying their name, **auto-generated concise summary**, document count, and an instant Attach/Detach toggle switch.
+
+4. **Knowledge Libraries View:**
+
+   - Grid/table of shared Knowledge Libraries showing `auto_summary`, document count, `usage_count` badge ("Used in X projects"), and inspectable document list (with **"Retry"** button on failed documents).
+
+   - Create Library, Upload Documents, Delete Document, and Delete Library buttons enabled for `library_operator` and `admin` (Delete Library disabled with clear tooltip whenever `usage_count > 0`).
+
+5. **Admin Console (`admin` only):**
+
+   - User Management (create user, assign/change role, delete user).
+
+   - Model & RAG Settings form + "Test All Connections" live status readout.
+
+
+
+---
+
+
+
+## STEP 9: MANAGEMENT SCRIPTS & VERSION-STAMPED INSTALLER BUILDER
+
+1. **Management Scripts (`scripts/` and symlinked/copied to root):**
+
+   - `start.sh`: Starts the stack via `docker compose up -d` and waits for healthchecks.
+
+   - `stop.sh`: Gracefully stops containers via `docker compose down`.
+
+   - `status.sh`: Displays current `VERSION`, container states (`docker compose ps`), disk usage of volumes, and backend `/api/health` + `/api/version` status.
+
+   - `logs.sh`: Tails logs (`docker compose logs -f --tail=100`).
+
+   - `backup.sh`: Creates a timestamped backup archive of SQLite DB, `.env`, and uploads.
+
+2. **Installer Builder (`build-installer.sh`):**
+
+   - Create `build-installer.sh` that reads `VERSION` from the root `VERSION` file and packages the entire application (source code, `docker-compose.yml`, Dockerfiles, `scripts/`, `.env.example`, and an embedded `install.sh` entrypoint) into a self-extracting, version-marked installer file:
+
+     `dist/ragwire-studio-installer-v${VERSION}.sh`
+
+   - When `ragwire-studio-installer-v${VERSION}.sh` is executed on a fresh target Linux VM:
+
+     1. Verifies `docker` and `docker compose` (v2) are installed (exiting with clear instructions if missing).
+
+     2. Prompts for or accepts `--install-dir` (default `/opt/ragwire-studio`) and `--port` (default `3000`).
+
+     3. Extracts all application files, preserves any existing `.env` on upgrades (or generates a fresh `.env` with a new random `JWT_SECRET_KEY` on fresh install), writes `VERSION`, makes all `.sh` scripts executable, builds the Docker images (`docker compose build`), and runs `./start.sh`.
+
+
+
+---
+
+
+
+## STEP 10: PLAYWRIGHT VERIFICATION & RELEASE `1.0.0`
+
+1. Install Playwright and Chromium in a test runner environment.
+
+2. Check if `100.69.140.69:8080`, `100.90.101.96:8082`, and `100.90.101.96:8083` are reachable from this VM:
+
+   - If reachable, run tests directly against them.
+
+   - If unreachable from this build VM, temporarily point the test settings to a lightweight local mock OpenAI + `/v1/rerank` server during Playwright execution (returning realistic streamed answers, ` ```mermaid ` diagrams, and ` ```infographic ` JSON blocks), then **restore the exact default URLs (`100.69.140.69:8080`, `100.90.101.96:8082`, `100.90.101.96:8083`)** in `.env` and SQLite once tests pass.
+
+3. Write and run an automated **Playwright** E2E suite verifying:
+
+   - Admin login (`admin@rag.local` / `admin`), creating a `library_operator` and a `normal_user`.
+
+   - Logging in as `library_operator`, creating a shared Knowledge Library, uploading a document and an image, testing duplicate upload rejection, verifying async status transitions to `indexed` and `auto_summary` populates.
+
+   - Verifying unauthenticated requests to `/api/files/{document_id}/content` return `401/403`, while authenticated requests succeed.
+
+   - Logging in as `normal_user`, verifying they cannot see Admin Console or create shared libraries, creating a Project, attaching the shared library (`usage_count` becomes `1`), uploading a project-specific file, and sending a chat message that returns a streamed answer with citations.
+
+   - Testing diagram generation (`mermaid` SVG renders without errors), infographic generation (structured infographic poster renders with KPIs/sections and export controls), response regeneration, and Markdown chat export.
+
+   - Verifying `library_operator` cannot delete the shared library while `usage_count == 1`.
+
+   - Deleting the Project as `normal_user`, verifying clean cascade deletion (dedicated files/vectors removed) and shared library `usage_count` drops back to `0`, after which `library_operator` can delete the shared library.
+
+4. Fix any issues uncovered by Playwright until 100% of tests pass.
+
+5. Bump `VERSION` to `1.0.0`, run `./build-installer.sh` to produce `dist/ragwire-studio-installer-v1.0.0.sh`, verify `./status.sh` shows `v1.0.0` healthy, write the final `1.0.0` completion summary in `progress.md`, and commit/tag `v1.0.0` in Git.
