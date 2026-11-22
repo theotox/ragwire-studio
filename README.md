@@ -59,8 +59,8 @@ To αρχείο αυτό (to-do.txt) βρίσκεται στο repository.
 
 * **`to-do.txt`** — Το πλήρες prompt / αρχιτεκτονικό specification που σχεδιάστηκε και δόθηκε στο OpenCode.
 * **`opencode.json`** — Το αρχείο ρυθμίσεων του OpenCode για τη σύνδεση με το τοπικό μοντέλο.
-* **`ragwire-studio-installer-v1.0.1.sh`** — Το αυτοτελές, version-marked εγκαταστάσιμο script της εφαρμογής στην έκδοση `v1.0.1` (οδηγίες χρήσης της εφαρμογής θα προστεθούν σε επόμενη φάση).
-
+* **`ragwire-studio-installer-v1.0.1.sh`** — Το αυτοτελές, version-marked εγκαταστάσιμο script της εφαρμογής στην έκδοση `v1.0.1`.
+* **`ragwire_studio_userguide.md`** - οδηγίες χρήσης της εφαρμογής.
 ---
 
 ## 🎥 Σχετικό Υλικό
